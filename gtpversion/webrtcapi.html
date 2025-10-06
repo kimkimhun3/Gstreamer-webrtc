@@ -173,10 +173,16 @@
         if (report.type === 'inbound-rtp' && report.kind === 'video') {
           videoStats = report;
         }
-        if (report.type === 'codec' && videoStats && report.id === videoStats.codecId) {
-          codecInfo = report;
-        }
       });
+
+      // Find codec info after we have videoStats
+      if (videoStats && videoStats.codecId) {
+        stats.forEach(report => {
+          if (report.type === 'codec' && report.id === videoStats.codecId) {
+            codecInfo = report;
+          }
+        });
+      }
 
       if (videoStats) {
         // Resolution
