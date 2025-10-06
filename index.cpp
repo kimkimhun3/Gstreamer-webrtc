@@ -39,7 +39,7 @@ static void on_negotiation_needed(GstElement *element, gpointer user_data);
 static void on_ice_candidate(GstElement *webrtc, guint mlineindex, gchar *candidate, gpointer user_data);
 static void send_ice_candidate_message(guint mlineindex, const gchar *candidate);
 static void on_incoming_stream(GstElement *webrtc, GstPad *pad, gpointer user_data);
-
+static void reset_webrtc_element();
 // Send JSON message via WebSocket
 static void send_json_message(JsonObject *msg) {
     if (!ws_conn) {
@@ -161,20 +161,27 @@ static void on_message(SoupWebsocketConnection *conn, SoupWebsocketDataType type
 
     } else if (g_strcmp0(msg_type, "request-offer") == 0) {
         // A viewer is requesting a fresh offer
-        const gchar *from_id = NULL;
-        if (json_object_has_member(object, "from")) {
-            from_id = json_object_get_string_member(object, "from");
+    const gchar *from_id = NULL;
+    if (json_object_has_member(object, "from")) {
+        from_id = json_object_get_string_member(object, "from");
+    }
+    
+    g_print("Received request-offer");
+    if (from_id) {
+        g_print(" from %s", from_id);
+        // Update peer_id to the new requester
+        if (peer_id) {
+            g_free(peer_id);
         }
-        
-        g_print("Received request-offer");
-        if (from_id) {
-            g_print(" from %s", from_id);
-        }
-        g_print("\n");
-        
-        // Reset state and create new offer
-        reset_peer_state();
-        force_renegotiate();
+        peer_id = g_strdup(from_id);
+    }
+    g_print("\n");
+    
+    // IMPORTANT: Always reset these flags
+    offer_in_progress = FALSE;
+    
+    // Create new offer
+    force_renegotiate();
         
     } else if (g_strcmp0(msg_type, "peer-left") == 0) {
         const gchar *left_id = NULL;
@@ -323,6 +330,7 @@ static void on_ice_gathering_state_notify(GstElement *webrtc, GParamSpec *pspec,
 }
 
 // Handle ICE connection state changes
+// Modify the on_ice_connection_state_notify function
 static void on_ice_connection_state_notify(GstElement *webrtc, GParamSpec *pspec, gpointer user_data) {
     GstWebRTCICEConnectionState ice_conn_state;
     g_object_get(webrtc, "ice-connection-state", &ice_conn_state, NULL);
@@ -349,8 +357,15 @@ static void on_ice_connection_state_notify(GstElement *webrtc, GParamSpec *pspec
             break;
         case GST_WEBRTC_ICE_CONNECTION_STATE_DISCONNECTED:
             state_str = "disconnected";
-            g_print("Peer disconnected\n");
+            g_print("Peer disconnected, ready for new connection\n");
             reset_peer_state();
+            // ADD THIS: Create new webrtcbin to reset state completely
+                // IMPORTANT: Reset the webrtcbin to clear transceivers
+            if (webrtc) {
+                g_print("Resetting webrtcbin state\n");
+                gst_element_set_state(webrtc, GST_STATE_READY);
+                gst_element_set_state(webrtc, GST_STATE_PLAYING);
+            }
             break;
         case GST_WEBRTC_ICE_CONNECTION_STATE_CLOSED:
             state_str = "closed";
@@ -362,7 +377,71 @@ static void on_ice_connection_state_notify(GstElement *webrtc, GParamSpec *pspec
     
     g_print("ICE connection state: %s\n", state_str);
 }
-
+// Add this new function to reset the webrtcbin element
+static void reset_webrtc_element() {
+    if (!webrtc || !pipeline) return;
+    
+    g_print("Resetting WebRTC element for new connection\n");
+    
+    // Disconnect all signals
+    g_signal_handlers_disconnect_by_data(webrtc, NULL);
+    
+    // Set to NULL state
+    gst_element_set_state(webrtc, GST_STATE_NULL);
+    
+    // Remove from pipeline
+    gst_bin_remove(GST_BIN(pipeline), webrtc);
+    gst_object_unref(webrtc);
+    
+    // Create new webrtcbin
+    webrtc = gst_element_factory_make("webrtcbin", "webrtcbin");
+    g_object_set(webrtc, 
+                 "bundle-policy", 0,  // max-bundle
+                 "stun-server", "stun://stun.l.google.com:19302",
+                 NULL);
+    
+    // Add back to pipeline
+    gst_bin_add(GST_BIN(pipeline), webrtc);
+    
+    // Reconnect signals
+    g_signal_connect(webrtc, "on-negotiation-needed", 
+                     G_CALLBACK(on_negotiation_needed), NULL);
+    g_signal_connect(webrtc, "on-ice-candidate", 
+                     G_CALLBACK(on_ice_candidate), NULL);
+    g_signal_connect(webrtc, "pad-added", 
+                     G_CALLBACK(on_incoming_stream), NULL);
+    g_signal_connect(webrtc, "notify::ice-gathering-state",
+                     G_CALLBACK(on_ice_gathering_state_notify), NULL);
+    g_signal_connect(webrtc, "notify::ice-connection-state",
+                     G_CALLBACK(on_ice_connection_state_notify), NULL);
+    
+    // Relink video and audio pads
+    GstElement *video_pay = gst_bin_get_by_name(GST_BIN(pipeline), "videopay");
+    GstElement *audio_pay = gst_bin_get_by_name(GST_BIN(pipeline), "audiopay");
+    
+    if (video_pay) {
+        GstPad *video_src = gst_element_get_static_pad(video_pay, "src");
+        GstPad *video_sink = gst_element_get_request_pad(webrtc, "sink_0");
+        gst_pad_link(video_src, video_sink);
+        gst_object_unref(video_src);
+        gst_object_unref(video_sink);
+        gst_object_unref(video_pay);
+    }
+    
+    if (audio_pay) {
+        GstPad *audio_src = gst_element_get_static_pad(audio_pay, "src");
+        GstPad *audio_sink = gst_element_get_request_pad(webrtc, "sink_1");
+        gst_pad_link(audio_src, audio_sink);
+        gst_object_unref(audio_src);
+        gst_object_unref(audio_sink);
+        gst_object_unref(audio_pay);
+    }
+    
+    // Sync state with pipeline
+    gst_element_sync_state_with_parent(webrtc);
+    
+    g_print("✓ WebRTC element reset complete\n");
+}
 // WebSocket connection established
 static void on_websocket_connected(GObject *session, GAsyncResult *res, gpointer user_data) {
     GError *error = NULL;

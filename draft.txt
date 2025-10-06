@@ -1,0 +1,6 @@
+Regarding the C++ program, currently it is working fine.
+But it can accept or do one session or one connection.
+For example, during the programming is running such as signaling sever, cpp program, and webb page are running to view the streaming, then when I click disconnect button to stop view the streaming at the HTML side, and connect it again, it can't be establish the new streaming again, until I rerun the CPP program again, look like the cpp is ignoring the connection, look like the CPP can't get the new client ID from the web again.
+So I want to solve it, and make it flexible to reconnect after disconnect and the CPP don't have to re run again.
+
+
